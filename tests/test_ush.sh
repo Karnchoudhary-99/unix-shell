@@ -3,6 +3,9 @@
 # Each case feeds a script to ./ush and checks stdout (and exit status).
 set -u
 cd "$(dirname "$0")/.."
+# Isolate history persistence: tests must never write to the real HOME.
+TESTHOME=$(mktemp -d)
+export HOME="$TESTHOME"
 fail=0
 
 check() {
@@ -48,7 +51,7 @@ check "missing redirect target recovers" "after-error" 0 'echo hi >' 'echo after
 
 # Redirection to files (checked on disk, not via stdout).
 tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT
+trap 'rm -rf "$tmpdir" "$TESTHOME"' EXIT
 printf 'echo redir > %s/out.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null
 if [ "$(cat "$tmpdir/out.txt")" = "redir" ]; then echo "ok: output redirect"; else echo "FAIL: output redirect" >&2; fail=1; fi
 printf 'echo more >> %s/out.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null
@@ -67,6 +70,17 @@ printf 'false &\nfg %%1\necho $? > %s/fg.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/n
 if [ "$(cat "$tmpdir/fg.txt")" = "1" ]; then echo "ok: fg returns job status"; else echo "FAIL: fg status — [$(cat "$tmpdir/fg.txt")]" >&2; fail=1; fi
 printf 'sleep 5 &\nkill %%1\nsleep 0.3\njobs > %s/kill.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null
 if [ "$(cat "$tmpdir/kill.txt")" = "[1] Done sleep 5" ]; then echo "ok: kill ends job"; else echo "FAIL: kill — [$(cat "$tmpdir/kill.txt")]" >&2; fail=1; fi
+
+# History: list, persistence across processes, clear.
+histhome=$(mktemp -d)
+printf 'echo a\necho b\nhistory > %s/hist.txt\nexit\n' "$tmpdir" | HOME="$histhome" ./ush 2>/dev/null
+if [ "$(wc -l < "$tmpdir/hist.txt" | tr -d ' ')" = "3" ] && grep -q "echo a" "$tmpdir/hist.txt" && grep -q "echo b" "$tmpdir/hist.txt"; then echo "ok: history lists entries"; else echo "FAIL: history list" >&2; fail=1; fi
+printf 'echo saved-one\nexit\n' | HOME="$histhome" ./ush 2>/dev/null >/dev/null
+printf 'history > %s/persist.txt\nexit\n' "$tmpdir" | HOME="$histhome" ./ush 2>/dev/null
+if grep -q "echo saved-one" "$tmpdir/persist.txt"; then echo "ok: history persists across processes"; else echo "FAIL: history persistence" >&2; fail=1; fi
+printf 'echo a\nhistory -c\nhistory > %s/cleared.txt\nexit\n' "$tmpdir" | HOME="$histhome" ./ush 2>/dev/null
+if [ "$(wc -l < "$tmpdir/cleared.txt" | tr -d ' ')" = "1" ]; then echo "ok: history -c clears"; else echo "FAIL: history -c" >&2; fail=1; fi
+rm -rf "$histhome"
 
 # help outputs several lines; verify the full listing separately.
 help_out=$(printf 'help\nexit\n' | ./ush 2>/dev/null)
