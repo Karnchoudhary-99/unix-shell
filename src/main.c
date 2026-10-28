@@ -681,6 +681,43 @@ static void clear_history(void) {
     nhist = 0;
 }
 
+static char *history_path(void) {
+    const char *home = getenv("HOME");
+    if (home == NULL) {
+        return NULL;
+    }
+    size_t len = strlen(home) + strlen("/.ush_history") + 1;
+    char *path = malloc(len);
+    if (path == NULL) {
+        return NULL;
+    }
+    snprintf(path, len, "%s/.ush_history", home);
+    return path;
+}
+
+static void load_history(void) {
+    char *path = history_path();
+    if (path == NULL) {
+        return;
+    }
+    FILE *f = fopen(path, "r");
+    free(path);
+    if (f == NULL) {
+        return; /* no history file yet: not an error */
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n;
+    while ((n = getline(&line, &cap, f)) >= 0) {
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+            line[--n] = '\0';
+        }
+        add_history(line);
+    }
+    free(line);
+    fclose(f);
+}
+
 static int builtin_history(char **argv, int argc) {
     if (argc == 2 && strcmp(argv[1], "-c") == 0) {
         clear_history();
@@ -914,6 +951,7 @@ int main(void) {
     size_t cap = 0;
     int last_status = 0;
 
+    load_history();
     for (;;) {
         reap_jobs(); /* silent: finished jobs surface via `jobs` */
         if (isatty(STDIN_FILENO)) {
