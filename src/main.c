@@ -268,6 +268,120 @@ done:
     return argc;
 }
 
+/* ---- Pipeline segments ----
+ * A parsed line is a pipeline of segments separated by '|'. Each
+ * segment owns an argv array (pointing at the line's token strings,
+ * which it must NOT free) plus optional redirections. The last
+ * redirection of each kind wins, as in POSIX shells. */
+struct segment {
+    char **argv;
+    int argc;
+    const char *infile;
+    const char *outfile;
+    int append;
+};
+
+static void free_segments(struct segment *segs, int nsegs) {
+    if (segs == NULL) {
+        return;
+    }
+    for (int i = 0; i < nsegs; i++) {
+        free(segs[i].argv);
+    }
+    free(segs);
+}
+
+static int is_operator_token(const char *s) {
+    return strcmp(s, "|") == 0 || strcmp(s, "<") == 0 ||
+           strcmp(s, ">") == 0 || strcmp(s, ">>") == 0;
+}
+
+/* Split a token argv into pipeline segments. Returns 0, or -1 on a
+ * syntax error (empty segment, dangling pipe, missing redirect target,
+ * or an operator where a filename was expected). */
+static int parse_pipeline(char **argv, int argc, struct segment **segs_out,
+                          int *nsegs_out) {
+    struct segment *segs = NULL;
+    int nsegs = 0, segs_cap = 0;
+    struct segment cur;
+    memset(&cur, 0, sizeof cur);
+    int cur_cap = 0;
+
+    for (int i = 0; i < argc; i++) {
+        const char *tok = argv[i];
+        if (strcmp(tok, "|") == 0) {
+            if (cur.argc == 0) {
+                fputs("ush: syntax error near '|'\n", stderr);
+                goto fail;
+            }
+            if (nsegs + 1 > segs_cap) {
+                int ncap = segs_cap ? segs_cap * 2 : 4;
+                struct segment *ns = realloc(segs, (size_t)ncap * sizeof *ns);
+                if (ns == NULL) {
+                    goto fail_nomsg;
+                }
+                segs = ns;
+                segs_cap = ncap;
+            }
+            cur.argv[cur.argc] = NULL;
+            segs[nsegs++] = cur;
+            memset(&cur, 0, sizeof cur);
+            cur_cap = 0;
+        } else if (strcmp(tok, "<") == 0 || strcmp(tok, ">") == 0 ||
+                   strcmp(tok, ">>") == 0) {
+            if (i + 1 >= argc || is_operator_token(argv[i + 1])) {
+                fprintf(stderr, "ush: syntax error near '%s'\n", tok);
+                goto fail;
+            }
+            if (strcmp(tok, "<") == 0) {
+                cur.infile = argv[++i];
+            } else {
+                cur.outfile = argv[++i];
+                cur.append = strcmp(tok, ">>") == 0;
+            }
+        } else {
+            if (cur.argc + 2 > cur_cap) {
+                int ncap = cur_cap ? cur_cap * 2 : 8;
+                char **na = realloc(cur.argv, (size_t)ncap * sizeof *na);
+                if (na == NULL) {
+                    goto fail_nomsg;
+                }
+                cur.argv = na;
+                cur_cap = ncap;
+            }
+            cur.argv[cur.argc++] = argv[i];
+        }
+    }
+    if (cur.argc == 0) {
+        fputs("ush: syntax error near end of line\n", stderr);
+        goto fail;
+    }
+    if (nsegs + 1 > segs_cap) {
+        int ncap = segs_cap ? segs_cap * 2 : 4;
+        struct segment *ns = realloc(segs, (size_t)ncap * sizeof *ns);
+        if (ns == NULL) {
+            goto fail_nomsg;
+        }
+        segs = ns;
+        segs_cap = ncap;
+    }
+    cur.argv[cur.argc] = NULL;
+    segs[nsegs++] = cur;
+    *segs_out = segs;
+    *nsegs_out = nsegs;
+    return 0;
+
+fail:
+    free(cur.argv);
+    free_segments(segs, nsegs);
+    return -1;
+fail_nomsg:
+    fputs("ush: out of memory\n", stderr);
+    free(cur.argv);
+    free_segments(segs, nsegs);
+    return -1;
+}
+
 static int run_external(char **argv) {
     pid_t pid = fork();
     if (pid < 0) {
