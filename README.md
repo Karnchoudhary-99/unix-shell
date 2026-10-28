@@ -11,7 +11,7 @@ redirection, job control and history next.
 - [x] Argument parsing (quoting, escaping, env expansion)
 - [x] Pipelines + I/O redirection
 - [x] Job control (background jobs, fg, jobs list)
-- [ ] Command history
+- [x] Command history
 - [ ] Self-review checklist, then public
 
 ## Quick start
@@ -81,6 +81,29 @@ ush> jobs
 ush> kill %1
 ush> jobs
 [1] Done sleep 30
+```
+
+## Command history
+
+Every non-blank line is recorded (up to 1000 entries) and persisted
+to `~/.ush_history` on exit, then reloaded at the next startup.
+`history` prints the numbered list, `history -c` clears it, and a line
+starting with `!` is expanded before parsing: `!!` re-runs the previous
+command, `!n` re-runs entry `n`, `!-n` re-runs the nth most recent
+entry, and `!prefix` re-runs the most recent entry starting with
+`prefix`. Extra words after the reference are appended to the expanded
+command, so `!! > out.txt` re-runs the previous command into a file.
+An unknown reference prints `event not found`, is not recorded, and
+the shell keeps running. There is no line editing or arrow-key recall:
+ush has no readline dependency, by design.
+
+```sh
+ush> echo hello
+hello
+ush> !!
+hello
+ush> !1
+hello
 ```
 
 ## License

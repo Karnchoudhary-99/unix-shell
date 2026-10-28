@@ -467,6 +467,8 @@ static int builtin_help(void) {
     puts("Jobs: cmd & runs in the background; jobs lists jobs,");
     puts("  fg %n waits for a job (its status becomes $?),");
     puts("  kill %n terminates one. No terminal control (no Ctrl-Z).");
+    puts("History: saved in ~/.ush_history; history lists it,");
+    puts("  history -c clears it, !! / !n / !-n / !prefix re-run entries.");
     puts("Anything else runs as an external command via PATH.");
     return 0;
 }
