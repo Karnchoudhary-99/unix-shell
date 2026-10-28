@@ -934,6 +934,10 @@ int main(void) {
             int status, should_exit;
             if (run_builtin(segs[0].argv, segs[0].argc, last_status,
                             &status, &should_exit)) {
+                /* Builtins write via stdio; when stdout is a pipe it
+                 * is fully buffered, so flush here or builtin output
+                 * would lag behind external commands' output. */
+                fflush(stdout);
                 last_status = status;
                 free_segments(segs, nsegs);
                 free_argv(argv, argc);
