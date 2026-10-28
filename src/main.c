@@ -182,7 +182,7 @@ static int parse_line(const char *line, int last_status, char ***argv_out) {
             if (in_token) {
                 PUSH_TOKEN();
             }
-        } else if (c == '|' || c == '<' || c == '>') {
+        } else if (c == '|' || c == '<' || c == '>' || c == '&') {
             /* Operators are tokens of their own, even unspaced: a|b,
              * echo hi>file, cmd < in. Quoted operators stay literal
              * (handled by the SINGLE/DOUBLE branches above). */
