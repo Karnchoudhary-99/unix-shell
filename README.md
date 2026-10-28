@@ -1,8 +1,8 @@
 # Custom Unix Shell
 
 A small Unix shell in C, built from scratch — no readline, no parser
-generator. A prompt, builtins, and external commands first; pipelines,
-redirection, job control and history next.
+generator: prompt loop, builtins, POSIX-like parsing, pipelines,
+redirection, job control and command history.
 
 ## Roadmap
 
@@ -12,7 +12,7 @@ redirection, job control and history next.
 - [x] Pipelines + I/O redirection
 - [x] Job control (background jobs, fg, jobs list)
 - [x] Command history
-- [ ] Self-review checklist, then public
+- [x] Self-review checklist, then public
 
 ## Quick start
 
