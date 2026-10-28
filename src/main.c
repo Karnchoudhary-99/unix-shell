@@ -779,6 +779,13 @@ static int expand_history_line(const char *line, char **out) {
         if (nhist > 0) {
             entry = history_entries[nhist - 1];
         }
+    } else if (ref[1] == '-' && ref[2] >= '0' && ref[2] <= '9') {
+        /* !-n: nth most recent entry (e.g. !-1 is the previous line). */
+        char *end = NULL;
+        long n = strtol(ref + 2, &end, 10);
+        if (end != NULL && *end == '\0' && n >= 1 && n <= nhist) {
+            entry = history_entries[nhist - (int)n];
+        }
     } else if (ref[1] >= '0' && ref[1] <= '9') {
         char *end = NULL;
         long n = strtol(ref + 1, &end, 10);
