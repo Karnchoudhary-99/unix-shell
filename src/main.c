@@ -295,7 +295,8 @@ static void free_segments(struct segment *segs, int nsegs) {
 
 static int is_operator_token(const char *s) {
     return strcmp(s, "|") == 0 || strcmp(s, "<") == 0 ||
-           strcmp(s, ">") == 0 || strcmp(s, ">>") == 0;
+           strcmp(s, ">") == 0 || strcmp(s, ">>") == 0 ||
+           strcmp(s, "&") == 0;
 }
 
 /* Split a token argv into pipeline segments. Returns 0, or -1 on a
@@ -821,12 +822,38 @@ cleanup_fail:
     return 1;
 }
 
+/* Run a pipeline in the background: one supervisor child runs it to
+ * completion while the shell records the job and returns at once. */
+static int run_background(struct segment *segs, int nsegs, int last_status,
+                          char *cmd) {
+    if (njobs >= MAX_JOBS) {
+        fputs("ush: too many jobs\n", stderr);
+        free(cmd);
+        return 1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("ush: fork");
+        free(cmd);
+        return 1;
+    }
+    if (pid == 0) {
+        int status = run_pipeline(segs, nsegs, last_status);
+        fflush(stdout);
+        fflush(stderr);
+        _exit(status);
+    }
+    add_job(pid, cmd);
+    return 0;
+}
+
 int main(void) {
     char *line = NULL;
     size_t cap = 0;
     int last_status = 0;
 
     for (;;) {
+        reap_jobs(); /* silent: finished jobs surface via `jobs` */
         if (isatty(STDIN_FILENO)) {
             fputs("ush> ", stdout);
             fflush(stdout);
@@ -844,14 +871,64 @@ int main(void) {
             free_argv(argv, argc);
             continue; /* blank line / comment only */
         }
-        struct segment *segs = NULL;
-        int nsegs = 0;
-        if (parse_pipeline(argv, argc, &segs, &nsegs) != 0) {
-            last_status = 2; /* syntax error, keep the shell alive */
+        /* Trailing '&' marks a background job; any other '&' is a
+         * syntax error (ush has no && operator). cmd_argc is the
+         * argument count without the trailing '&'; argc stays the
+         * parse_line count so free_argv frees every token. */
+        int background = 0;
+        int cmd_argc = argc;
+        char *job_cmd = NULL;
+        if (argc > 0 && strcmp(argv[argc - 1], "&") == 0) {
+            background = 1;
+            cmd_argc = argc - 1;
+            if (cmd_argc == 0) {
+                fputs("ush: syntax error near '&'\n", stderr);
+                last_status = 2;
+                free_argv(argv, argc);
+                continue;
+            }
+            size_t len = 0;
+            for (int i = 0; i < cmd_argc; i++) {
+                len += strlen(argv[i]) + 1;
+            }
+            job_cmd = malloc(len + 1);
+            if (job_cmd != NULL) {
+                job_cmd[0] = '\0';
+                for (int i = 0; i < cmd_argc; i++) {
+                    if (i > 0) {
+                        strcat(job_cmd, " ");
+                    }
+                    strcat(job_cmd, argv[i]);
+                }
+            }
+        }
+        int stray_amp = 0;
+        for (int i = 0; i < cmd_argc; i++) {
+            if (strcmp(argv[i], "&") == 0) {
+                stray_amp = 1;
+                break;
+            }
+        }
+        if (stray_amp) {
+            fputs("ush: syntax error near '&'\n", stderr);
+            last_status = 2;
+            free(job_cmd);
             free_argv(argv, argc);
             continue;
         }
-        if (nsegs == 1 && segs[0].infile == NULL && segs[0].outfile == NULL) {
+        struct segment *segs = NULL;
+        int nsegs = 0;
+        if (parse_pipeline(argv, cmd_argc, &segs, &nsegs) != 0) {
+            last_status = 2; /* syntax error, keep the shell alive */
+            free(job_cmd);
+            free_argv(argv, argc);
+            continue;
+        }
+        if (background) {
+            last_status = run_background(segs, nsegs, last_status, job_cmd);
+            free_segments(segs, nsegs);
+            free_argv(argv, argc);
+        } else if (nsegs == 1 && segs[0].infile == NULL && segs[0].outfile == NULL) {
             /* Plain single command: builtins run in the shell itself
              * so cd/exit affect this process. */
             int status, should_exit;
