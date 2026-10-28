@@ -10,6 +10,7 @@ $(BIN): $(SRC)
 
 test: $(BIN)
 	./tests/smoke.sh
+	./tests/test_ush.sh
 
 clean:
 	rm -f $(BIN)
