@@ -641,6 +641,61 @@ static int builtin_kill(char **argv, int argc) {
     return 0;
 }
 
+/* ---- Command history (in-memory list) ---- */
+#define MAX_HISTORY 1000
+
+static char **history_entries = NULL;
+static int nhist = 0;
+static int hist_cap = 0;
+
+static void add_history(const char *line) {
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p == '\0') {
+        return; /* blank lines are not history */
+    }
+    if (nhist >= MAX_HISTORY) {
+        free(history_entries[0]);
+        memmove(&history_entries[0], &history_entries[1],
+                (size_t)(nhist - 1) * sizeof *history_entries);
+        nhist--;
+    }
+    if (nhist + 1 > hist_cap) {
+        int ncap = hist_cap ? hist_cap * 2 : 64;
+        char **na = realloc(history_entries, (size_t)ncap * sizeof *na);
+        if (na == NULL) {
+            return;
+        }
+        history_entries = na;
+        hist_cap = ncap;
+    }
+    history_entries[nhist++] = strdup(line);
+}
+
+static void clear_history(void) {
+    for (int i = 0; i < nhist; i++) {
+        free(history_entries[i]);
+    }
+    nhist = 0;
+}
+
+static int builtin_history(char **argv, int argc) {
+    if (argc == 2 && strcmp(argv[1], "-c") == 0) {
+        clear_history();
+        return 0;
+    }
+    if (argc != 1) {
+        fputs("ush: history: usage: history [-c]\n", stderr);
+        return 1;
+    }
+    for (int i = 0; i < nhist; i++) {
+        printf("%5d  %s\n", i + 1, history_entries[i]);
+    }
+    return 0;
+}
+
 static int run_builtin(char **argv, int argc, int last_status,
                        int *out, int *should_exit) {
     *should_exit = 0;
@@ -666,6 +721,10 @@ static int run_builtin(char **argv, int argc, int last_status,
     }
     if (strcmp(argv[0], "kill") == 0) {
         *out = builtin_kill(argv, argc);
+        return 1;
+    }
+    if (strcmp(argv[0], "history") == 0) {
+        *out = builtin_history(argv, argc);
         return 1;
     }
     if (strcmp(argv[0], "exit") == 0) {
@@ -864,6 +923,12 @@ int main(void) {
         if (getline(&line, &cap, stdin) < 0) {
             break; /* EOF */
         }
+        size_t linelen = strlen(line);
+        while (linelen > 0 &&
+               (line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) {
+            line[--linelen] = '\0';
+        }
+        add_history(line);
         char **argv = NULL;
         int argc = parse_line(line, last_status, &argv);
         if (argc < 0) {
