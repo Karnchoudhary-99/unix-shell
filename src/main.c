@@ -575,6 +575,10 @@ static int run_pipeline(struct segment *segs, int nsegs, int last_status) {
             int status, should_exit;
             if (run_builtin(segs[i].argv, segs[i].argc, last_status,
                             &status, &should_exit)) {
+                /* _exit does not flush stdio: a builtin writing to a
+                 * pipe (fully buffered) would lose its output. */
+                fflush(stdout);
+                fflush(stderr);
                 _exit(status);
             }
             execvp(segs[i].argv[0], segs[i].argv);
