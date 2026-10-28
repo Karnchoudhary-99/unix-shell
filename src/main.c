@@ -3,6 +3,7 @@
  * history are later roadmap items. */
 #define _POSIX_C_SOURCE 200809L
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -494,6 +495,143 @@ static int run_builtin(char **argv, int argc, int last_status,
     return 0;
 }
 
+/* Run a pipeline (or a single command with redirections). Redirect
+ * files are opened up front so a bad path fails before any stage
+ * runs; each stage's stdin is its input redirect, else the previous
+ * pipe, and its stdout is its output redirect, else the next pipe.
+ * Returns the last stage's exit status. */
+static int run_pipeline(struct segment *segs, int nsegs, int last_status) {
+    int *in_fd = calloc((size_t)nsegs, sizeof *in_fd);
+    int *out_fd = calloc((size_t)nsegs, sizeof *out_fd);
+    pid_t *pids = calloc((size_t)nsegs, sizeof *pids);
+    if (in_fd == NULL || out_fd == NULL || pids == NULL) {
+        free(in_fd);
+        free(out_fd);
+        free(pids);
+        return 1;
+    }
+    for (int i = 0; i < nsegs; i++) {
+        in_fd[i] = -1;
+        out_fd[i] = -1;
+        if (segs[i].infile != NULL) {
+            in_fd[i] = open(segs[i].infile, O_RDONLY);
+            if (in_fd[i] < 0) {
+                fprintf(stderr, "ush: %s: ", segs[i].infile);
+                perror("");
+                goto cleanup_fail;
+            }
+        }
+        if (segs[i].outfile != NULL) {
+            int flags = O_WRONLY | O_CREAT | (segs[i].append ? O_APPEND : O_TRUNC);
+            out_fd[i] = open(segs[i].outfile, flags, 0644);
+            if (out_fd[i] < 0) {
+                fprintf(stderr, "ush: %s: ", segs[i].outfile);
+                perror("");
+                goto cleanup_fail;
+            }
+        }
+    }
+
+    int prev_read = -1;
+    for (int i = 0; i < nsegs; i++) {
+        int pipefd[2] = {-1, -1};
+        if (i < nsegs - 1 && pipe(pipefd) != 0) {
+            perror("ush: pipe");
+            goto cleanup_fail;
+        }
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("ush: fork");
+            goto cleanup_fail;
+        }
+        if (pid == 0) {
+            if (in_fd[i] >= 0) {
+                dup2(in_fd[i], STDIN_FILENO);
+            } else if (prev_read >= 0) {
+                dup2(prev_read, STDIN_FILENO);
+            }
+            if (out_fd[i] >= 0) {
+                dup2(out_fd[i], STDOUT_FILENO);
+            } else if (i < nsegs - 1) {
+                dup2(pipefd[1], STDOUT_FILENO);
+            }
+            if (prev_read >= 0) {
+                close(prev_read);
+            }
+            if (pipefd[0] >= 0) {
+                close(pipefd[0]);
+            }
+            if (pipefd[1] >= 0) {
+                close(pipefd[1]);
+            }
+            for (int j = 0; j < nsegs; j++) {
+                if (in_fd[j] >= 0) {
+                    close(in_fd[j]);
+                }
+                if (out_fd[j] >= 0) {
+                    close(out_fd[j]);
+                }
+            }
+            int status, should_exit;
+            if (run_builtin(segs[i].argv, segs[i].argc, last_status,
+                            &status, &should_exit)) {
+                _exit(status);
+            }
+            execvp(segs[i].argv[0], segs[i].argv);
+            fprintf(stderr, "ush: %s: ", segs[i].argv[0]);
+            perror("");
+            _exit(127);
+        }
+        pids[i] = pid;
+        if (prev_read >= 0) {
+            close(prev_read);
+        }
+        if (pipefd[1] >= 0) {
+            close(pipefd[1]);
+        }
+        prev_read = pipefd[0];
+        if (in_fd[i] >= 0) {
+            close(in_fd[i]);
+            in_fd[i] = -1;
+        }
+        if (out_fd[i] >= 0) {
+            close(out_fd[i]);
+            out_fd[i] = -1;
+        }
+    }
+    if (prev_read >= 0) {
+        close(prev_read);
+    }
+    int last = 0;
+    for (int i = 0; i < nsegs; i++) {
+        int status;
+        while (waitpid(pids[i], &status, 0) < 0) {
+            /* retry on EINTR */
+        }
+        if (i == nsegs - 1) {
+            last = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        }
+    }
+    free(in_fd);
+    free(out_fd);
+    free(pids);
+    return last;
+
+cleanup_fail:
+    for (int i = 0; i < nsegs; i++) {
+        if (in_fd[i] >= 0) {
+            close(in_fd[i]);
+        }
+        if (out_fd[i] >= 0) {
+            close(out_fd[i]);
+        }
+    }
+    free(in_fd);
+    free(out_fd);
+    free(pids);
+    return 1;
+}
+
 int main(void) {
     char *line = NULL;
     size_t cap = 0;
@@ -517,15 +655,33 @@ int main(void) {
             free_argv(argv, argc);
             continue; /* blank line / comment only */
         }
-        int status, should_exit;
-        if (run_builtin(argv, argc, last_status, &status, &should_exit)) {
-            last_status = status;
+        struct segment *segs = NULL;
+        int nsegs = 0;
+        if (parse_pipeline(argv, argc, &segs, &nsegs) != 0) {
+            last_status = 2; /* syntax error, keep the shell alive */
             free_argv(argv, argc);
-            if (should_exit) {
-                break;
+            continue;
+        }
+        if (nsegs == 1 && segs[0].infile == NULL && segs[0].outfile == NULL) {
+            /* Plain single command: builtins run in the shell itself
+             * so cd/exit affect this process. */
+            int status, should_exit;
+            if (run_builtin(segs[0].argv, segs[0].argc, last_status,
+                            &status, &should_exit)) {
+                last_status = status;
+                free_segments(segs, nsegs);
+                free_argv(argv, argc);
+                if (should_exit) {
+                    break;
+                }
+            } else {
+                last_status = run_external(segs[0].argv);
+                free_segments(segs, nsegs);
+                free_argv(argv, argc);
             }
         } else {
-            last_status = run_external(argv);
+            last_status = run_pipeline(segs, nsegs, last_status);
+            free_segments(segs, nsegs);
             free_argv(argv, argc);
         }
     }
