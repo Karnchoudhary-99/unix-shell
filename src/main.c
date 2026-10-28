@@ -460,6 +460,8 @@ static int builtin_help(void) {
     puts("  pwd         print the working directory");
     puts("  help        show this list");
     puts("  exit [n]    leave the shell (default: last command's status)");
+    puts("Pipelines: cmd1 | cmd2 (exit status is the last stage's).");
+    puts("Redirection: < file, > file (truncate), >> file (append).");
     puts("Anything else runs as an external command via PATH.");
     return 0;
 }
