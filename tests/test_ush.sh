@@ -60,6 +60,14 @@ if [ "$(cat "$tmpdir/piped.txt")" = "piped" ]; then echo "ok: pipeline into file
 bad_out=$(printf 'echo SHOULDNOTAPPEAR | cat < %s/nope.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null)
 if [ -z "$bad_out" ]; then echo "ok: failed input redirect runs nothing"; else echo "FAIL: failed input redirect ran a stage" >&2; fail=1; fi
 
+# Job control: background jobs, jobs listing, fg status, kill.
+printf 'sleep 0.3 &\njobs > %s/j1.txt\nsleep 0.6\njobs > %s/j2.txt\nexit\n' "$tmpdir" "$tmpdir" | ./ush 2>/dev/null
+if [ "$(cat "$tmpdir/j1.txt")" = "[1] Running sleep 0.3" ] && [ "$(cat "$tmpdir/j2.txt")" = "[1] Done sleep 0.3" ]; then echo "ok: jobs running then done"; else echo "FAIL: jobs listing — j1=[$(cat "$tmpdir/j1.txt")] j2=[$(cat "$tmpdir/j2.txt")]" >&2; fail=1; fi
+printf 'false &\nfg %%1\necho $? > %s/fg.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null
+if [ "$(cat "$tmpdir/fg.txt")" = "1" ]; then echo "ok: fg returns job status"; else echo "FAIL: fg status — [$(cat "$tmpdir/fg.txt")]" >&2; fail=1; fi
+printf 'sleep 5 &\nkill %%1\nsleep 0.3\njobs > %s/kill.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null
+if [ "$(cat "$tmpdir/kill.txt")" = "[1] Done sleep 5" ]; then echo "ok: kill ends job"; else echo "FAIL: kill — [$(cat "$tmpdir/kill.txt")]" >&2; fail=1; fi
+
 # help outputs several lines; verify the full listing separately.
 help_out=$(printf 'help\nexit\n' | ./ush 2>/dev/null)
 case "$help_out" in
