@@ -82,6 +82,18 @@ printf 'echo a\nhistory -c\nhistory > %s/cleared.txt\nexit\n' "$tmpdir" | HOME="
 if [ "$(wc -l < "$tmpdir/cleared.txt" | tr -d ' ')" = "1" ]; then echo "ok: history -c clears"; else echo "FAIL: history -c" >&2; fail=1; fi
 rm -rf "$histhome"
 
+# History expansion: !!, !n, !prefix, !-n, and error recovery.
+printf 'echo alpha\n!! > %s/bangbang.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null >/dev/null
+if [ "$(cat "$tmpdir/bangbang.txt")" = "alpha" ]; then echo "ok: !! expansion"; else echo "FAIL: !! expansion" >&2; fail=1; fi
+printf 'echo one\necho two\n!2 > %s/bangn.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null >/dev/null
+if [ "$(cat "$tmpdir/bangn.txt")" = "two" ]; then echo "ok: !n expansion"; else echo "FAIL: !n expansion" >&2; fail=1; fi
+printf 'echo prefix-test\n!ec > %s/bangprefix.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null >/dev/null
+if [ "$(cat "$tmpdir/bangprefix.txt")" = "prefix-test" ]; then echo "ok: !prefix expansion"; else echo "FAIL: !prefix expansion" >&2; fail=1; fi
+printf 'echo one\necho two\necho three\n!-2 > %s/bangrel.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null >/dev/null
+if [ "$(cat "$tmpdir/bangrel.txt")" = "two" ]; then echo "ok: !-n expansion"; else echo "FAIL: !-n expansion" >&2; fail=1; fi
+printf '!99\necho after-error > %s/bangerr.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null >/dev/null
+if [ "$(cat "$tmpdir/bangerr.txt")" = "after-error" ]; then echo "ok: failed expansion recovers"; else echo "FAIL: failed expansion recovery" >&2; fail=1; fi
+
 # help outputs several lines; verify the full listing separately.
 help_out=$(printf 'help\nexit\n' | ./ush 2>/dev/null)
 case "$help_out" in
