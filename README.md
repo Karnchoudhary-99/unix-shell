@@ -9,7 +9,7 @@ redirection, job control and history next.
 - [x] Project scaffold (Makefile, REPL skeleton, smoke test, CI, README)
 - [x] Prompt loop + builtins (exit, cd, pwd, help)
 - [x] Argument parsing (quoting, escaping, env expansion)
-- [ ] Pipelines + I/O redirection
+- [x] Pipelines + I/O redirection
 - [ ] Job control (background jobs, fg/bg, jobs list)
 - [ ] Command history
 - [ ] Self-review checklist, then public
@@ -41,6 +41,25 @@ ush> echo 'no expansion $HOME'
 ush> echo a\ b        # one argument: "a b"
 ush> false
 ush> echo $?          # 1
+```
+
+## Pipelines and redirection
+
+Stages are separated by `|`, with no spaces required (`echo hi|cat` works).
+A stage's exit status is the last stage's. Input and output redirection
+(`<`, `>`, `>>`) apply per stage and win over the pipe on that side, so
+`cat < in.txt | sort > out.txt` reads from the file and writes to it.
+Redirect files are opened before any stage runs, so a bad path (e.g.
+`cat < missing.txt`) runs nothing and reports the error. A syntax error
+(dangling pipe, missing redirect target) prints an error and the shell
+keeps running.
+
+```sh
+ush> echo one two | tr a-z A-Z
+ONE TWO
+ush> echo hello > greeting.txt
+ush> cat < greeting.txt | tr a-z A-Z
+HELLO
 ```
 
 ## License

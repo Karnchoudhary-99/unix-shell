@@ -3,6 +3,7 @@
  * history are later roadmap items. */
 #define _POSIX_C_SOURCE 200809L
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -181,6 +182,33 @@ static int parse_line(const char *line, int last_status, char ***argv_out) {
             if (in_token) {
                 PUSH_TOKEN();
             }
+        } else if (c == '|' || c == '<' || c == '>') {
+            /* Operators are tokens of their own, even unspaced: a|b,
+             * echo hi>file, cmd < in. Quoted operators stay literal
+             * (handled by the SINGLE/DOUBLE branches above). */
+            if (in_token) {
+                PUSH_TOKEN();
+            }
+            if (c == '>' && p[1] == '>') {
+                cur.data = strdup(">>");
+                cur.len = 2;
+                cur.cap = 3;
+                p++;
+            } else {
+                cur.data = malloc(2);
+                if (cur.data != NULL) {
+                    cur.data[0] = c;
+                    cur.data[1] = '\0';
+                }
+                cur.len = 1;
+                cur.cap = 2;
+            }
+            if (cur.data == NULL) {
+                rc = -1;
+                goto done;
+            }
+            in_token = 1;
+            PUSH_TOKEN();
         } else if (c == '#' && !in_token) {
             break; /* comment runs to end of line */
         } else if (c == '\'') {
@@ -239,6 +267,120 @@ done:
     argv[argc] = NULL;
     *argv_out = argv;
     return argc;
+}
+
+/* ---- Pipeline segments ----
+ * A parsed line is a pipeline of segments separated by '|'. Each
+ * segment owns an argv array (pointing at the line's token strings,
+ * which it must NOT free) plus optional redirections. The last
+ * redirection of each kind wins, as in POSIX shells. */
+struct segment {
+    char **argv;
+    int argc;
+    const char *infile;
+    const char *outfile;
+    int append;
+};
+
+static void free_segments(struct segment *segs, int nsegs) {
+    if (segs == NULL) {
+        return;
+    }
+    for (int i = 0; i < nsegs; i++) {
+        free(segs[i].argv);
+    }
+    free(segs);
+}
+
+static int is_operator_token(const char *s) {
+    return strcmp(s, "|") == 0 || strcmp(s, "<") == 0 ||
+           strcmp(s, ">") == 0 || strcmp(s, ">>") == 0;
+}
+
+/* Split a token argv into pipeline segments. Returns 0, or -1 on a
+ * syntax error (empty segment, dangling pipe, missing redirect target,
+ * or an operator where a filename was expected). */
+static int parse_pipeline(char **argv, int argc, struct segment **segs_out,
+                          int *nsegs_out) {
+    struct segment *segs = NULL;
+    int nsegs = 0, segs_cap = 0;
+    struct segment cur;
+    memset(&cur, 0, sizeof cur);
+    int cur_cap = 0;
+
+    for (int i = 0; i < argc; i++) {
+        const char *tok = argv[i];
+        if (strcmp(tok, "|") == 0) {
+            if (cur.argc == 0) {
+                fputs("ush: syntax error near '|'\n", stderr);
+                goto fail;
+            }
+            if (nsegs + 1 > segs_cap) {
+                int ncap = segs_cap ? segs_cap * 2 : 4;
+                struct segment *ns = realloc(segs, (size_t)ncap * sizeof *ns);
+                if (ns == NULL) {
+                    goto fail_nomsg;
+                }
+                segs = ns;
+                segs_cap = ncap;
+            }
+            cur.argv[cur.argc] = NULL;
+            segs[nsegs++] = cur;
+            memset(&cur, 0, sizeof cur);
+            cur_cap = 0;
+        } else if (strcmp(tok, "<") == 0 || strcmp(tok, ">") == 0 ||
+                   strcmp(tok, ">>") == 0) {
+            if (i + 1 >= argc || is_operator_token(argv[i + 1])) {
+                fprintf(stderr, "ush: syntax error near '%s'\n", tok);
+                goto fail;
+            }
+            if (strcmp(tok, "<") == 0) {
+                cur.infile = argv[++i];
+            } else {
+                cur.outfile = argv[++i];
+                cur.append = strcmp(tok, ">>") == 0;
+            }
+        } else {
+            if (cur.argc + 2 > cur_cap) {
+                int ncap = cur_cap ? cur_cap * 2 : 8;
+                char **na = realloc(cur.argv, (size_t)ncap * sizeof *na);
+                if (na == NULL) {
+                    goto fail_nomsg;
+                }
+                cur.argv = na;
+                cur_cap = ncap;
+            }
+            cur.argv[cur.argc++] = argv[i];
+        }
+    }
+    if (cur.argc == 0) {
+        fputs("ush: syntax error near end of line\n", stderr);
+        goto fail;
+    }
+    if (nsegs + 1 > segs_cap) {
+        int ncap = segs_cap ? segs_cap * 2 : 4;
+        struct segment *ns = realloc(segs, (size_t)ncap * sizeof *ns);
+        if (ns == NULL) {
+            goto fail_nomsg;
+        }
+        segs = ns;
+        segs_cap = ncap;
+    }
+    cur.argv[cur.argc] = NULL;
+    segs[nsegs++] = cur;
+    *segs_out = segs;
+    *nsegs_out = nsegs;
+    return 0;
+
+fail:
+    free(cur.argv);
+    free_segments(segs, nsegs);
+    return -1;
+fail_nomsg:
+    fputs("ush: out of memory\n", stderr);
+    free(cur.argv);
+    free_segments(segs, nsegs);
+    return -1;
 }
 
 static int run_external(char **argv) {
@@ -318,6 +460,8 @@ static int builtin_help(void) {
     puts("  pwd         print the working directory");
     puts("  help        show this list");
     puts("  exit [n]    leave the shell (default: last command's status)");
+    puts("Pipelines: cmd1 | cmd2 (exit status is the last stage's).");
+    puts("Redirection: < file, > file (truncate), >> file (append).");
     puts("Anything else runs as an external command via PATH.");
     return 0;
 }
@@ -353,6 +497,147 @@ static int run_builtin(char **argv, int argc, int last_status,
     return 0;
 }
 
+/* Run a pipeline (or a single command with redirections). Redirect
+ * files are opened up front so a bad path fails before any stage
+ * runs; each stage's stdin is its input redirect, else the previous
+ * pipe, and its stdout is its output redirect, else the next pipe.
+ * Returns the last stage's exit status. */
+static int run_pipeline(struct segment *segs, int nsegs, int last_status) {
+    int *in_fd = calloc((size_t)nsegs, sizeof *in_fd);
+    int *out_fd = calloc((size_t)nsegs, sizeof *out_fd);
+    pid_t *pids = calloc((size_t)nsegs, sizeof *pids);
+    if (in_fd == NULL || out_fd == NULL || pids == NULL) {
+        free(in_fd);
+        free(out_fd);
+        free(pids);
+        return 1;
+    }
+    for (int i = 0; i < nsegs; i++) {
+        in_fd[i] = -1;
+        out_fd[i] = -1;
+        if (segs[i].infile != NULL) {
+            in_fd[i] = open(segs[i].infile, O_RDONLY);
+            if (in_fd[i] < 0) {
+                fprintf(stderr, "ush: %s: ", segs[i].infile);
+                perror("");
+                goto cleanup_fail;
+            }
+        }
+        if (segs[i].outfile != NULL) {
+            int flags = O_WRONLY | O_CREAT | (segs[i].append ? O_APPEND : O_TRUNC);
+            out_fd[i] = open(segs[i].outfile, flags, 0644);
+            if (out_fd[i] < 0) {
+                fprintf(stderr, "ush: %s: ", segs[i].outfile);
+                perror("");
+                goto cleanup_fail;
+            }
+        }
+    }
+
+    int prev_read = -1;
+    for (int i = 0; i < nsegs; i++) {
+        int pipefd[2] = {-1, -1};
+        if (i < nsegs - 1 && pipe(pipefd) != 0) {
+            perror("ush: pipe");
+            goto cleanup_fail;
+        }
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("ush: fork");
+            goto cleanup_fail;
+        }
+        if (pid == 0) {
+            if (in_fd[i] >= 0) {
+                dup2(in_fd[i], STDIN_FILENO);
+            } else if (prev_read >= 0) {
+                dup2(prev_read, STDIN_FILENO);
+            }
+            if (out_fd[i] >= 0) {
+                dup2(out_fd[i], STDOUT_FILENO);
+            } else if (i < nsegs - 1) {
+                dup2(pipefd[1], STDOUT_FILENO);
+            }
+            if (prev_read >= 0) {
+                close(prev_read);
+            }
+            if (pipefd[0] >= 0) {
+                close(pipefd[0]);
+            }
+            if (pipefd[1] >= 0) {
+                close(pipefd[1]);
+            }
+            for (int j = 0; j < nsegs; j++) {
+                if (in_fd[j] >= 0) {
+                    close(in_fd[j]);
+                }
+                if (out_fd[j] >= 0) {
+                    close(out_fd[j]);
+                }
+            }
+            int status, should_exit;
+            if (run_builtin(segs[i].argv, segs[i].argc, last_status,
+                            &status, &should_exit)) {
+                /* _exit does not flush stdio: a builtin writing to a
+                 * pipe (fully buffered) would lose its output. */
+                fflush(stdout);
+                fflush(stderr);
+                _exit(status);
+            }
+            execvp(segs[i].argv[0], segs[i].argv);
+            fprintf(stderr, "ush: %s: ", segs[i].argv[0]);
+            perror("");
+            _exit(127);
+        }
+        pids[i] = pid;
+        if (prev_read >= 0) {
+            close(prev_read);
+        }
+        if (pipefd[1] >= 0) {
+            close(pipefd[1]);
+        }
+        prev_read = pipefd[0];
+        if (in_fd[i] >= 0) {
+            close(in_fd[i]);
+            in_fd[i] = -1;
+        }
+        if (out_fd[i] >= 0) {
+            close(out_fd[i]);
+            out_fd[i] = -1;
+        }
+    }
+    if (prev_read >= 0) {
+        close(prev_read);
+    }
+    int last = 0;
+    for (int i = 0; i < nsegs; i++) {
+        int status;
+        while (waitpid(pids[i], &status, 0) < 0) {
+            /* retry on EINTR */
+        }
+        if (i == nsegs - 1) {
+            last = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        }
+    }
+    free(in_fd);
+    free(out_fd);
+    free(pids);
+    return last;
+
+cleanup_fail:
+    for (int i = 0; i < nsegs; i++) {
+        if (in_fd[i] >= 0) {
+            close(in_fd[i]);
+        }
+        if (out_fd[i] >= 0) {
+            close(out_fd[i]);
+        }
+    }
+    free(in_fd);
+    free(out_fd);
+    free(pids);
+    return 1;
+}
+
 int main(void) {
     char *line = NULL;
     size_t cap = 0;
@@ -376,15 +661,33 @@ int main(void) {
             free_argv(argv, argc);
             continue; /* blank line / comment only */
         }
-        int status, should_exit;
-        if (run_builtin(argv, argc, last_status, &status, &should_exit)) {
-            last_status = status;
+        struct segment *segs = NULL;
+        int nsegs = 0;
+        if (parse_pipeline(argv, argc, &segs, &nsegs) != 0) {
+            last_status = 2; /* syntax error, keep the shell alive */
             free_argv(argv, argc);
-            if (should_exit) {
-                break;
+            continue;
+        }
+        if (nsegs == 1 && segs[0].infile == NULL && segs[0].outfile == NULL) {
+            /* Plain single command: builtins run in the shell itself
+             * so cd/exit affect this process. */
+            int status, should_exit;
+            if (run_builtin(segs[0].argv, segs[0].argc, last_status,
+                            &status, &should_exit)) {
+                last_status = status;
+                free_segments(segs, nsegs);
+                free_argv(argv, argc);
+                if (should_exit) {
+                    break;
+                }
+            } else {
+                last_status = run_external(segs[0].argv);
+                free_segments(segs, nsegs);
+                free_argv(argv, argc);
             }
         } else {
-            last_status = run_external(argv);
+            last_status = run_pipeline(segs, nsegs, last_status);
+            free_segments(segs, nsegs);
             free_argv(argv, argc);
         }
     }
