@@ -12,15 +12,232 @@
 
 #define MAX_ARGS 64
 
-/* Split a line on whitespace in place; returns argc, argv is NULL-terminated. */
-static int tokenize(char *line, char **argv) {
-    int argc = 0;
-    char *tok = strtok(line, " \t\r\n");
-    while (tok != NULL && argc < MAX_ARGS - 1) {
-        argv[argc++] = tok;
-        tok = strtok(NULL, " \t\r\n");
+/* ---- Argument parser: quoting, escaping, env expansion, comments ----
+ * Rules (POSIX-like, simplified):
+ *   '...'  literal, no expansion, no escapes inside
+ *   "..."  $VAR/${VAR}/$?/$$ expand; backslash escapes only $, `, ", \, newline
+ *   unquoted backslash escapes the next character literally
+ *   # starts a comment when it begins a word
+ *   an empty quoted string is still an argument (echo "" passes one arg)
+ * On an unterminated quote, returns -1 and prints a diagnostic. */
+
+struct sbuf {
+    char *data;
+    size_t len;
+    size_t cap;
+};
+
+static int sbuf_putc(struct sbuf *b, char c) {
+    if (b->len + 2 > b->cap) {
+        size_t ncap = b->cap ? b->cap * 2 : 32;
+        char *nd = realloc(b->data, ncap);
+        if (nd == NULL) {
+            return -1;
+        }
+        b->data = nd;
+        b->cap = ncap;
+    }
+    b->data[b->len++] = c;
+    b->data[b->len] = '\0';
+    return 0;
+}
+
+static int sbuf_puts(struct sbuf *b, const char *s) {
+    for (; *s; s++) {
+        if (sbuf_putc(b, *s) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int is_var_start(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+
+static int is_var_char(char c) {
+    return is_var_start(c) || (c >= '0' && c <= '9');
+}
+
+/* Expand $... at *p (pointing just past the '$'); advances *p past the
+ * expansion and appends the value. Returns 0, or -1 on allocation failure. */
+static int expand_var(const char **p, struct sbuf *out, int last_status) {
+    const char *s = *p;
+    if (*s == '?') {
+        char num[16];
+        snprintf(num, sizeof num, "%d", last_status);
+        *p = s + 1;
+        return sbuf_puts(out, num);
+    }
+    if (*s == '$') {
+        char num[32];
+        snprintf(num, sizeof num, "%d", (int)getpid());
+        *p = s + 1;
+        return sbuf_puts(out, num);
+    }
+    char name[256];
+    size_t n = 0;
+    if (*s == '{') {
+        s++;
+        while (*s && *s != '}' && n < sizeof name - 1) {
+            name[n++] = *s++;
+        }
+        if (*s == '}') {
+            s++;
+        } else {
+            /* No closing brace: treat the whole thing literally. */
+            if (sbuf_putc(out, '$') != 0 || sbuf_putc(out, '{') != 0) {
+                return -1;
+            }
+            name[n] = '\0';
+            return sbuf_puts(out, name);
+        }
+    } else if (is_var_start(*s)) {
+        while (is_var_char(*s) && n < sizeof name - 1) {
+            name[n++] = *s++;
+        }
+    } else {
+        /* Lone '$' followed by something else: keep it literal. */
+        return sbuf_putc(out, '$');
+    }
+    name[n] = '\0';
+    const char *val = getenv(name);
+    *p = s;
+    return val ? sbuf_puts(out, val) : 0;
+}
+
+static void free_argv(char **argv, int argc) {
+    if (argv == NULL) {
+        return;
+    }
+    for (int i = 0; i < argc; i++) {
+        free(argv[i]);
+    }
+    free(argv);
+}
+
+/* Parse one input line into a freshly allocated NULL-terminated argv.
+ * Returns argc, or -1 on an unterminated quote (argv left NULL). */
+static int parse_line(const char *line, int last_status, char ***argv_out) {
+    char **argv = NULL;
+    int argc = 0, argv_cap = 0;
+    struct sbuf cur = {NULL, 0, 0};
+    int in_token = 0;
+
+    enum { UNQUOTED, SINGLE, DOUBLE } state = UNQUOTED;
+    const char *p = line;
+    int rc = 0;
+
+    /* Helper macros: append a finished token to argv (takes ownership). */
+#define PUSH_TOKEN() do { \
+        if (argc + 2 > argv_cap) { \
+            int ncap = argv_cap ? argv_cap * 2 : 16; \
+            char **na = realloc(argv, (size_t)ncap * sizeof *na); \
+            if (na == NULL) { rc = -1; goto done; } \
+            argv = na; argv_cap = ncap; \
+        } \
+        argv[argc++] = cur.data ? cur.data : strdup(""); \
+        cur.data = NULL; cur.len = 0; cur.cap = 0; \
+        in_token = 0; \
+    } while (0)
+
+    for (; *p; p++) {
+        char c = *p;
+        if (state == SINGLE) {
+            if (c == '\'') {
+                state = UNQUOTED;
+            } else if (sbuf_putc(&cur, c) != 0) {
+                rc = -1;
+                goto done;
+            }
+            continue;
+        }
+        if (state == DOUBLE) {
+            if (c == '"') {
+                state = UNQUOTED;
+            } else if (c == '\\' && (p[1] == '$' || p[1] == '`' ||
+                                     p[1] == '"' || p[1] == '\\' ||
+                                     p[1] == '\n')) {
+                p++;
+                if (p[0] != '\n' && sbuf_putc(&cur, p[0]) != 0) {
+                    rc = -1;
+                    goto done;
+                }
+            } else if (c == '$') {
+                p++;
+                if (expand_var(&p, &cur, last_status) != 0) {
+                    rc = -1;
+                    goto done;
+                }
+                p--; /* loop's p++ lands on the char after the expansion */
+            } else if (sbuf_putc(&cur, c) != 0) {
+                rc = -1;
+                goto done;
+            }
+            continue;
+        }
+        /* UNQUOTED */
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            if (in_token) {
+                PUSH_TOKEN();
+            }
+        } else if (c == '#' && !in_token) {
+            break; /* comment runs to end of line */
+        } else if (c == '\'') {
+            state = SINGLE;
+            in_token = 1;
+        } else if (c == '"') {
+            state = DOUBLE;
+            in_token = 1;
+        } else if (c == '\\' && p[1] != '\0') {
+            p++;
+            if (p[0] != '\n' && sbuf_putc(&cur, p[0]) != 0) {
+                rc = -1;
+                goto done;
+            }
+            in_token = 1;
+        } else if (c == '$') {
+            p++;
+            if (expand_var(&p, &cur, last_status) != 0) {
+                rc = -1;
+                goto done;
+            }
+            p--;
+            in_token = 1;
+        } else {
+            if (sbuf_putc(&cur, c) != 0) {
+                rc = -1;
+                goto done;
+            }
+            in_token = 1;
+        }
+    }
+    if (state != UNQUOTED) {
+        fputs("ush: unterminated quote\n", stderr);
+        rc = -1;
+        goto done;
+    }
+    if (in_token) {
+        PUSH_TOKEN();
+    }
+#undef PUSH_TOKEN
+
+done:
+    free(cur.data);
+    if (rc != 0) {
+        free_argv(argv, argc);
+        *argv_out = NULL;
+        return -1;
+    }
+    if (argv == NULL) {
+        argv = calloc(1, sizeof *argv);
+        if (argv == NULL) {
+            *argv_out = NULL;
+            return -1;
+        }
     }
     argv[argc] = NULL;
+    *argv_out = argv;
     return argc;
 }
 
@@ -32,7 +249,8 @@ static int run_external(char **argv) {
     }
     if (pid == 0) {
         execvp(argv[0], argv);
-        perror("ush");
+        fprintf(stderr, "ush: %s: ", argv[0]);
+        perror("");
         _exit(127);
     }
     int status;
@@ -138,7 +356,6 @@ static int run_builtin(char **argv, int argc, int last_status,
 int main(void) {
     char *line = NULL;
     size_t cap = 0;
-    char *argv[MAX_ARGS];
     int last_status = 0;
 
     for (;;) {
@@ -149,18 +366,26 @@ int main(void) {
         if (getline(&line, &cap, stdin) < 0) {
             break; /* EOF */
         }
-        int argc = tokenize(line, argv);
+        char **argv = NULL;
+        int argc = parse_line(line, last_status, &argv);
+        if (argc < 0) {
+            last_status = 2; /* parse error, keep the shell alive */
+            continue;
+        }
         if (argc == 0) {
-            continue; /* blank line */
+            free_argv(argv, argc);
+            continue; /* blank line / comment only */
         }
         int status, should_exit;
         if (run_builtin(argv, argc, last_status, &status, &should_exit)) {
             last_status = status;
+            free_argv(argv, argc);
             if (should_exit) {
                 break;
             }
         } else {
             last_status = run_external(argv);
+            free_argv(argv, argc);
         }
     }
     free(line);
