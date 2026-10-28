@@ -181,6 +181,33 @@ static int parse_line(const char *line, int last_status, char ***argv_out) {
             if (in_token) {
                 PUSH_TOKEN();
             }
+        } else if (c == '|' || c == '<' || c == '>') {
+            /* Operators are tokens of their own, even unspaced: a|b,
+             * echo hi>file, cmd < in. Quoted operators stay literal
+             * (handled by the SINGLE/DOUBLE branches above). */
+            if (in_token) {
+                PUSH_TOKEN();
+            }
+            if (c == '>' && p[1] == '>') {
+                cur.data = strdup(">>");
+                cur.len = 2;
+                cur.cap = 3;
+                p++;
+            } else {
+                cur.data = malloc(2);
+                if (cur.data != NULL) {
+                    cur.data[0] = c;
+                    cur.data[1] = '\0';
+                }
+                cur.len = 1;
+                cur.cap = 2;
+            }
+            if (cur.data == NULL) {
+                rc = -1;
+                goto done;
+            }
+            in_token = 1;
+            PUSH_TOKEN();
         } else if (c == '#' && !in_token) {
             break; /* comment runs to end of line */
         } else if (c == '\'') {
