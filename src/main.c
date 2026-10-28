@@ -718,6 +718,22 @@ static void load_history(void) {
     fclose(f);
 }
 
+static void save_history(void) {
+    char *path = history_path();
+    if (path == NULL) {
+        return;
+    }
+    FILE *f = fopen(path, "w");
+    free(path);
+    if (f == NULL) {
+        return; /* unwritable HOME: history just stays in memory */
+    }
+    for (int i = 0; i < nhist; i++) {
+        fprintf(f, "%s\n", history_entries[i]);
+    }
+    fclose(f);
+}
+
 static int builtin_history(char **argv, int argc) {
     if (argc == 2 && strcmp(argv[1], "-c") == 0) {
         clear_history();
@@ -1061,6 +1077,7 @@ int main(void) {
             free_argv(argv, argc);
         }
     }
+    save_history();
     free(line);
     return last_status;
 }
