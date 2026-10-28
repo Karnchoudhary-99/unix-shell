@@ -467,6 +467,8 @@ static int builtin_help(void) {
     puts("Jobs: cmd & runs in the background; jobs lists jobs,");
     puts("  fg %n waits for a job (its status becomes $?),");
     puts("  kill %n terminates one. No terminal control (no Ctrl-Z).");
+    puts("History: saved in ~/.ush_history; history lists it,");
+    puts("  history -c clears it, !! / !n / !-n / !prefix re-run entries.");
     puts("Anything else runs as an external command via PATH.");
     return 0;
 }
@@ -641,6 +643,193 @@ static int builtin_kill(char **argv, int argc) {
     return 0;
 }
 
+/* ---- Command history (in-memory list) ---- */
+#define MAX_HISTORY 1000
+
+static char **history_entries = NULL;
+static int nhist = 0;
+static int hist_cap = 0;
+
+static void add_history(const char *line) {
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p == '\0') {
+        return; /* blank lines are not history */
+    }
+    if (nhist >= MAX_HISTORY) {
+        free(history_entries[0]);
+        memmove(&history_entries[0], &history_entries[1],
+                (size_t)(nhist - 1) * sizeof *history_entries);
+        nhist--;
+    }
+    if (nhist + 1 > hist_cap) {
+        int ncap = hist_cap ? hist_cap * 2 : 64;
+        char **na = realloc(history_entries, (size_t)ncap * sizeof *na);
+        if (na == NULL) {
+            return;
+        }
+        history_entries = na;
+        hist_cap = ncap;
+    }
+    history_entries[nhist++] = strdup(line);
+}
+
+static void clear_history(void) {
+    for (int i = 0; i < nhist; i++) {
+        free(history_entries[i]);
+    }
+    nhist = 0;
+}
+
+static char *history_path(void) {
+    const char *home = getenv("HOME");
+    if (home == NULL) {
+        return NULL;
+    }
+    size_t len = strlen(home) + strlen("/.ush_history") + 1;
+    char *path = malloc(len);
+    if (path == NULL) {
+        return NULL;
+    }
+    snprintf(path, len, "%s/.ush_history", home);
+    return path;
+}
+
+static void load_history(void) {
+    char *path = history_path();
+    if (path == NULL) {
+        return;
+    }
+    FILE *f = fopen(path, "r");
+    free(path);
+    if (f == NULL) {
+        return; /* no history file yet: not an error */
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n;
+    while ((n = getline(&line, &cap, f)) >= 0) {
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+            line[--n] = '\0';
+        }
+        add_history(line);
+    }
+    free(line);
+    fclose(f);
+}
+
+static void save_history(void) {
+    char *path = history_path();
+    if (path == NULL) {
+        return;
+    }
+    FILE *f = fopen(path, "w");
+    free(path);
+    if (f == NULL) {
+        return; /* unwritable HOME: history just stays in memory */
+    }
+    for (int i = 0; i < nhist; i++) {
+        fprintf(f, "%s\n", history_entries[i]);
+    }
+    fclose(f);
+}
+
+static int builtin_history(char **argv, int argc) {
+    if (argc == 2 && strcmp(argv[1], "-c") == 0) {
+        clear_history();
+        return 0;
+    }
+    if (argc != 1) {
+        fputs("ush: history: usage: history [-c]\n", stderr);
+        return 1;
+    }
+    for (int i = 0; i < nhist; i++) {
+        printf("%5d  %s\n", i + 1, history_entries[i]);
+    }
+    return 0;
+}
+
+/* History expansion: a line starting with '!' is replaced before
+ * parsing. Returns 1 if expanded (*out owns the new line), 0 if the
+ * line needs no expansion, -1 on "event not found" (diagnostic
+ * printed, line not added to history). The expansion is not itself
+ * re-expanded. */
+static int expand_history_line(const char *line, char **out) {
+    *out = NULL;
+    if (line[0] != '!') {
+        return 0;
+    }
+    size_t toklen = 0;
+    while (line[toklen] != '\0' && line[toklen] != ' ' &&
+           line[toklen] != '\t') {
+        toklen++;
+    }
+    if (toklen <= 1) {
+        fputs("ush: !: event not found\n", stderr);
+        return -1;
+    }
+    char *ref = malloc(toklen + 1);
+    if (ref == NULL) {
+        return -1;
+    }
+    memcpy(ref, line, toklen);
+    ref[toklen] = '\0';
+    const char *entry = NULL;
+    if (strcmp(ref, "!!") == 0) {
+        if (nhist > 0) {
+            entry = history_entries[nhist - 1];
+        }
+    } else if (ref[1] == '-' && ref[2] >= '0' && ref[2] <= '9') {
+        /* !-n: nth most recent entry (e.g. !-1 is the previous line). */
+        char *end = NULL;
+        long n = strtol(ref + 2, &end, 10);
+        if (end != NULL && *end == '\0' && n >= 1 && n <= nhist) {
+            entry = history_entries[nhist - (int)n];
+        }
+    } else if (ref[1] >= '0' && ref[1] <= '9') {
+        char *end = NULL;
+        long n = strtol(ref + 1, &end, 10);
+        if (end != NULL && *end == '\0' && n >= 1 && n <= nhist) {
+            entry = history_entries[n - 1];
+        }
+    } else {
+        /* !prefix: most recent entry starting with the prefix. */
+        const char *prefix = ref + 1;
+        size_t plen = strlen(prefix);
+        for (int i = nhist - 1; i >= 0; i--) {
+            if (strncmp(history_entries[i], prefix, plen) == 0) {
+                entry = history_entries[i];
+                break;
+            }
+        }
+    }
+    if (entry == NULL) {
+        fprintf(stderr, "ush: %s: event not found\n", ref);
+        free(ref);
+        return -1;
+    }
+    const char *rest = line + toklen;
+    while (*rest == ' ' || *rest == '\t') {
+        rest++;
+    }
+    size_t len = strlen(entry) + (*rest ? strlen(rest) + 1 : 0) + 1;
+    char *expanded = malloc(len);
+    if (expanded == NULL) {
+        free(ref);
+        return -1;
+    }
+    strcpy(expanded, entry);
+    if (*rest) {
+        strcat(expanded, " ");
+        strcat(expanded, rest);
+    }
+    free(ref);
+    *out = expanded;
+    return 1;
+}
+
 static int run_builtin(char **argv, int argc, int last_status,
                        int *out, int *should_exit) {
     *should_exit = 0;
@@ -666,6 +855,10 @@ static int run_builtin(char **argv, int argc, int last_status,
     }
     if (strcmp(argv[0], "kill") == 0) {
         *out = builtin_kill(argv, argc);
+        return 1;
+    }
+    if (strcmp(argv[0], "history") == 0) {
+        *out = builtin_history(argv, argc);
         return 1;
     }
     if (strcmp(argv[0], "exit") == 0) {
@@ -855,6 +1048,7 @@ int main(void) {
     size_t cap = 0;
     int last_status = 0;
 
+    load_history();
     for (;;) {
         reap_jobs(); /* silent: finished jobs surface via `jobs` */
         if (isatty(STDIN_FILENO)) {
@@ -864,6 +1058,23 @@ int main(void) {
         if (getline(&line, &cap, stdin) < 0) {
             break; /* EOF */
         }
+        size_t linelen = strlen(line);
+        while (linelen > 0 &&
+               (line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) {
+            line[--linelen] = '\0';
+        }
+        char *expanded = NULL;
+        int exp_rc = expand_history_line(line, &expanded);
+        if (exp_rc < 0) {
+            last_status = 1; /* event not found, keep shell alive */
+            continue;
+        }
+        if (exp_rc == 1) {
+            free(line);
+            line = expanded;
+            cap = strlen(line) + 1;
+        }
+        add_history(line);
         char **argv = NULL;
         int argc = parse_line(line, last_status, &argv);
         if (argc < 0) {
@@ -958,6 +1169,7 @@ int main(void) {
             free_argv(argv, argc);
         }
     }
+    save_history();
     free(line);
     return last_status;
 }
