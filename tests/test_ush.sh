@@ -85,8 +85,12 @@ rm -rf "$histhome"
 # History expansion: !!, !n, !prefix, !-n, and error recovery.
 printf 'echo alpha\n!! > %s/bangbang.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null >/dev/null
 if [ "$(cat "$tmpdir/bangbang.txt")" = "alpha" ]; then echo "ok: !! expansion"; else echo "FAIL: !! expansion" >&2; fail=1; fi
-printf 'echo one\necho two\n!2 > %s/bangn.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null >/dev/null
+# !n is absolute, so it needs a fresh history file: the shared test
+# HOME already holds entries from earlier cases in this script.
+bangnhome=$(mktemp -d)
+printf 'echo one\necho two\n!2 > %s/bangn.txt\nexit\n' "$tmpdir" | HOME="$bangnhome" ./ush 2>/dev/null >/dev/null
 if [ "$(cat "$tmpdir/bangn.txt")" = "two" ]; then echo "ok: !n expansion"; else echo "FAIL: !n expansion" >&2; fail=1; fi
+rm -rf "$bangnhome"
 printf 'echo prefix-test\n!ec > %s/bangprefix.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null >/dev/null
 if [ "$(cat "$tmpdir/bangprefix.txt")" = "prefix-test" ]; then echo "ok: !prefix expansion"; else echo "FAIL: !prefix expansion" >&2; fail=1; fi
 printf 'echo one\necho two\necho three\n!-2 > %s/bangrel.txt\nexit\n' "$tmpdir" | ./ush 2>/dev/null >/dev/null
