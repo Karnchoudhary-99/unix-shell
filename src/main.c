@@ -464,6 +464,9 @@ static int builtin_help(void) {
     puts("  exit [n]    leave the shell (default: last command's status)");
     puts("Pipelines: cmd1 | cmd2 (exit status is the last stage's).");
     puts("Redirection: < file, > file (truncate), >> file (append).");
+    puts("Jobs: cmd & runs in the background; jobs lists jobs,");
+    puts("  fg %n waits for a job (its status becomes $?),");
+    puts("  kill %n terminates one. No terminal control (no Ctrl-Z).");
     puts("Anything else runs as an external command via PATH.");
     return 0;
 }

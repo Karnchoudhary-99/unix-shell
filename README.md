@@ -10,7 +10,7 @@ redirection, job control and history next.
 - [x] Prompt loop + builtins (exit, cd, pwd, help)
 - [x] Argument parsing (quoting, escaping, env expansion)
 - [x] Pipelines + I/O redirection
-- [ ] Job control (background jobs, fg/bg, jobs list)
+- [x] Job control (background jobs, fg, jobs list)
 - [ ] Command history
 - [ ] Self-review checklist, then public
 
@@ -60,6 +60,27 @@ ONE TWO
 ush> echo hello > greeting.txt
 ush> cat < greeting.txt | tr a-z A-Z
 HELLO
+```
+
+## Job control
+
+A trailing `&` runs a command or pipeline in the background under one
+supervisor process; the shell prints `[n] pid` and returns at once.
+`jobs` lists running jobs and any that finished since the last check
+(finished jobs are cleared after being reported), `fg %n` waits for a
+job and makes its exit status the shell's `$?`, and `kill %n` sends
+SIGTERM to a job. This is simplified job control: there is no terminal
+handover and no Ctrl-Z stopping, and a background builtin runs in its
+supervisor process, so `cd /tmp &` does not change the shell's directory.
+
+```sh
+ush> sleep 30 &
+[1] 12345
+ush> jobs
+[1] Running sleep 30
+ush> kill %1
+ush> jobs
+[1] Done sleep 30
 ```
 
 ## License
