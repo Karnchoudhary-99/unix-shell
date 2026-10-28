@@ -4,6 +4,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -182,7 +183,7 @@ static int parse_line(const char *line, int last_status, char ***argv_out) {
             if (in_token) {
                 PUSH_TOKEN();
             }
-        } else if (c == '|' || c == '<' || c == '>') {
+        } else if (c == '|' || c == '<' || c == '>' || c == '&') {
             /* Operators are tokens of their own, even unspaced: a|b,
              * echo hi>file, cmd < in. Quoted operators stay literal
              * (handled by the SINGLE/DOUBLE branches above). */
@@ -294,7 +295,8 @@ static void free_segments(struct segment *segs, int nsegs) {
 
 static int is_operator_token(const char *s) {
     return strcmp(s, "|") == 0 || strcmp(s, "<") == 0 ||
-           strcmp(s, ">") == 0 || strcmp(s, ">>") == 0;
+           strcmp(s, ">") == 0 || strcmp(s, ">>") == 0 ||
+           strcmp(s, "&") == 0;
 }
 
 /* Split a token argv into pipeline segments. Returns 0, or -1 on a
@@ -462,7 +464,180 @@ static int builtin_help(void) {
     puts("  exit [n]    leave the shell (default: last command's status)");
     puts("Pipelines: cmd1 | cmd2 (exit status is the last stage's).");
     puts("Redirection: < file, > file (truncate), >> file (append).");
+    puts("Jobs: cmd & runs in the background; jobs lists jobs,");
+    puts("  fg %n waits for a job (its status becomes $?),");
+    puts("  kill %n terminates one. No terminal control (no Ctrl-Z).");
     puts("Anything else runs as an external command via PATH.");
+    return 0;
+}
+
+/* ---- Job control (simplified) ----
+ * Background pipelines run under one supervisor child each, so a job
+ * is a single pid. There is no terminal control here: no Ctrl-Z
+ * stopping, no fg/bg terminal handover — jobs, fg (wait for a job)
+ * and kill %n are the supported surface. Finished jobs are reaped
+ * silently before each prompt (no zombies) and reported once by
+ * `jobs`, which then clears them. */
+#define MAX_JOBS 64
+
+struct job {
+    int id;
+    pid_t pid;
+    char *cmd;
+    int done;
+    int status;
+};
+
+static struct job jobs[MAX_JOBS];
+static int njobs = 0;
+static int next_job_id = 1;
+
+static void reap_jobs(void) {
+    for (int i = 0; i < njobs; i++) {
+        if (jobs[i].done) {
+            continue;
+        }
+        int status;
+        pid_t r = waitpid(jobs[i].pid, &status, WNOHANG);
+        if (r == jobs[i].pid) {
+            jobs[i].done = 1;
+            jobs[i].status = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        }
+    }
+}
+
+static void remove_job_at(int idx) {
+    free(jobs[idx].cmd);
+    memmove(&jobs[idx], &jobs[idx + 1],
+            (size_t)(njobs - idx - 1) * sizeof jobs[idx]);
+    njobs--;
+}
+
+static struct job *find_job(int id) {
+    for (int i = 0; i < njobs; i++) {
+        if (jobs[i].id == id) {
+            return &jobs[i];
+        }
+    }
+    return NULL;
+}
+
+static int add_job(pid_t pid, char *cmd) {
+    if (njobs >= MAX_JOBS) {
+        fputs("ush: too many jobs\n", stderr);
+        free(cmd);
+        return -1;
+    }
+    int id = next_job_id++;
+    jobs[njobs].id = id;
+    jobs[njobs].pid = pid;
+    jobs[njobs].cmd = cmd;
+    jobs[njobs].done = 0;
+    jobs[njobs].status = 0;
+    njobs++;
+    printf("[%d] %d\n", id, (int)pid);
+    fflush(stdout);
+    return id;
+}
+
+static int parse_job_arg(const char *s, int *id_out) {
+    if (s[0] == '%') {
+        s++;
+    }
+    if (*s == '\0') {
+        return -1;
+    }
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == NULL || *end != '\0' || v <= 0) {
+        return -1;
+    }
+    *id_out = (int)v;
+    return 0;
+}
+
+static int builtin_jobs(void) {
+    reap_jobs();
+    for (int i = 0; i < njobs; i++) {
+        printf("[%d] %s %s\n", jobs[i].id,
+               jobs[i].done ? "Done" : "Running", jobs[i].cmd);
+    }
+    for (int i = njobs - 1; i >= 0; i--) {
+        if (jobs[i].done) {
+            remove_job_at(i);
+        }
+    }
+    return 0;
+}
+
+static int builtin_fg(char **argv, int argc) {
+    if (argc != 2) {
+        fputs("ush: fg: usage: fg %n\n", stderr);
+        return 1;
+    }
+    int id;
+    if (parse_job_arg(argv[1], &id) != 0) {
+        fprintf(stderr, "ush: fg: %s: no such job\n", argv[1]);
+        return 1;
+    }
+    reap_jobs();
+    struct job *job = find_job(id);
+    if (job == NULL) {
+        fprintf(stderr, "ush: fg: %%%d: no such job\n", id);
+        return 1;
+    }
+    if (!job->done) {
+        int status;
+        while (waitpid(job->pid, &status, 0) < 0) {
+            /* retry on EINTR */
+        }
+        job->status = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        job->done = 1;
+    }
+    int status = job->status;
+    /* find_job's pointer is invalidated by removal: locate by id. */
+    for (int i = 0; i < njobs; i++) {
+        if (jobs[i].id == id) {
+            remove_job_at(i);
+            break;
+        }
+    }
+    return status;
+}
+
+static int builtin_kill(char **argv, int argc) {
+    if (argc != 2) {
+        fputs("ush: kill: usage: kill %n | kill <pid>\n", stderr);
+        return 1;
+    }
+    pid_t pid;
+    if (argv[1][0] == '%') {
+        int id;
+        if (parse_job_arg(argv[1], &id) != 0) {
+            fprintf(stderr, "ush: kill: %s: no such job\n", argv[1]);
+            return 1;
+        }
+        reap_jobs();
+        struct job *job = find_job(id);
+        if (job == NULL || job->done) {
+            fprintf(stderr, "ush: kill: %%%d: no such job\n", id);
+            return 1;
+        }
+        pid = job->pid;
+    } else {
+        char *end = NULL;
+        long v = strtol(argv[1], &end, 10);
+        if (end == NULL || *end != '\0' || v <= 0) {
+            fprintf(stderr, "ush: kill: %s: invalid pid\n", argv[1]);
+            return 1;
+        }
+        pid = (pid_t)v;
+    }
+    if (kill(pid, SIGTERM) != 0) {
+        fprintf(stderr, "ush: kill: %s: ", argv[1]);
+        perror("");
+        return 1;
+    }
     return 0;
 }
 
@@ -479,6 +654,18 @@ static int run_builtin(char **argv, int argc, int last_status,
     }
     if (strcmp(argv[0], "help") == 0) {
         *out = builtin_help();
+        return 1;
+    }
+    if (strcmp(argv[0], "jobs") == 0) {
+        *out = builtin_jobs();
+        return 1;
+    }
+    if (strcmp(argv[0], "fg") == 0) {
+        *out = builtin_fg(argv, argc);
+        return 1;
+    }
+    if (strcmp(argv[0], "kill") == 0) {
+        *out = builtin_kill(argv, argc);
         return 1;
     }
     if (strcmp(argv[0], "exit") == 0) {
@@ -638,12 +825,38 @@ cleanup_fail:
     return 1;
 }
 
+/* Run a pipeline in the background: one supervisor child runs it to
+ * completion while the shell records the job and returns at once. */
+static int run_background(struct segment *segs, int nsegs, int last_status,
+                          char *cmd) {
+    if (njobs >= MAX_JOBS) {
+        fputs("ush: too many jobs\n", stderr);
+        free(cmd);
+        return 1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("ush: fork");
+        free(cmd);
+        return 1;
+    }
+    if (pid == 0) {
+        int status = run_pipeline(segs, nsegs, last_status);
+        fflush(stdout);
+        fflush(stderr);
+        _exit(status);
+    }
+    add_job(pid, cmd);
+    return 0;
+}
+
 int main(void) {
     char *line = NULL;
     size_t cap = 0;
     int last_status = 0;
 
     for (;;) {
+        reap_jobs(); /* silent: finished jobs surface via `jobs` */
         if (isatty(STDIN_FILENO)) {
             fputs("ush> ", stdout);
             fflush(stdout);
@@ -661,19 +874,73 @@ int main(void) {
             free_argv(argv, argc);
             continue; /* blank line / comment only */
         }
-        struct segment *segs = NULL;
-        int nsegs = 0;
-        if (parse_pipeline(argv, argc, &segs, &nsegs) != 0) {
-            last_status = 2; /* syntax error, keep the shell alive */
+        /* Trailing '&' marks a background job; any other '&' is a
+         * syntax error (ush has no && operator). cmd_argc is the
+         * argument count without the trailing '&'; argc stays the
+         * parse_line count so free_argv frees every token. */
+        int background = 0;
+        int cmd_argc = argc;
+        char *job_cmd = NULL;
+        if (argc > 0 && strcmp(argv[argc - 1], "&") == 0) {
+            background = 1;
+            cmd_argc = argc - 1;
+            if (cmd_argc == 0) {
+                fputs("ush: syntax error near '&'\n", stderr);
+                last_status = 2;
+                free_argv(argv, argc);
+                continue;
+            }
+            size_t len = 0;
+            for (int i = 0; i < cmd_argc; i++) {
+                len += strlen(argv[i]) + 1;
+            }
+            job_cmd = malloc(len + 1);
+            if (job_cmd != NULL) {
+                job_cmd[0] = '\0';
+                for (int i = 0; i < cmd_argc; i++) {
+                    if (i > 0) {
+                        strcat(job_cmd, " ");
+                    }
+                    strcat(job_cmd, argv[i]);
+                }
+            }
+        }
+        int stray_amp = 0;
+        for (int i = 0; i < cmd_argc; i++) {
+            if (strcmp(argv[i], "&") == 0) {
+                stray_amp = 1;
+                break;
+            }
+        }
+        if (stray_amp) {
+            fputs("ush: syntax error near '&'\n", stderr);
+            last_status = 2;
+            free(job_cmd);
             free_argv(argv, argc);
             continue;
         }
-        if (nsegs == 1 && segs[0].infile == NULL && segs[0].outfile == NULL) {
+        struct segment *segs = NULL;
+        int nsegs = 0;
+        if (parse_pipeline(argv, cmd_argc, &segs, &nsegs) != 0) {
+            last_status = 2; /* syntax error, keep the shell alive */
+            free(job_cmd);
+            free_argv(argv, argc);
+            continue;
+        }
+        if (background) {
+            last_status = run_background(segs, nsegs, last_status, job_cmd);
+            free_segments(segs, nsegs);
+            free_argv(argv, argc);
+        } else if (nsegs == 1 && segs[0].infile == NULL && segs[0].outfile == NULL) {
             /* Plain single command: builtins run in the shell itself
              * so cd/exit affect this process. */
             int status, should_exit;
             if (run_builtin(segs[0].argv, segs[0].argc, last_status,
                             &status, &should_exit)) {
+                /* Builtins write via stdio; when stdout is a pipe it
+                 * is fully buffered, so flush here or builtin output
+                 * would lag behind external commands' output. */
+                fflush(stdout);
                 last_status = status;
                 free_segments(segs, nsegs);
                 free_argv(argv, argc);
