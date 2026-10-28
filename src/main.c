@@ -4,6 +4,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -466,6 +467,176 @@ static int builtin_help(void) {
     return 0;
 }
 
+/* ---- Job control (simplified) ----
+ * Background pipelines run under one supervisor child each, so a job
+ * is a single pid. There is no terminal control here: no Ctrl-Z
+ * stopping, no fg/bg terminal handover — jobs, fg (wait for a job)
+ * and kill %n are the supported surface. Finished jobs are reaped
+ * silently before each prompt (no zombies) and reported once by
+ * `jobs`, which then clears them. */
+#define MAX_JOBS 64
+
+struct job {
+    int id;
+    pid_t pid;
+    char *cmd;
+    int done;
+    int status;
+};
+
+static struct job jobs[MAX_JOBS];
+static int njobs = 0;
+static int next_job_id = 1;
+
+static void reap_jobs(void) {
+    for (int i = 0; i < njobs; i++) {
+        if (jobs[i].done) {
+            continue;
+        }
+        int status;
+        pid_t r = waitpid(jobs[i].pid, &status, WNOHANG);
+        if (r == jobs[i].pid) {
+            jobs[i].done = 1;
+            jobs[i].status = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        }
+    }
+}
+
+static void remove_job_at(int idx) {
+    free(jobs[idx].cmd);
+    memmove(&jobs[idx], &jobs[idx + 1],
+            (size_t)(njobs - idx - 1) * sizeof jobs[idx]);
+    njobs--;
+}
+
+static struct job *find_job(int id) {
+    for (int i = 0; i < njobs; i++) {
+        if (jobs[i].id == id) {
+            return &jobs[i];
+        }
+    }
+    return NULL;
+}
+
+static int add_job(pid_t pid, char *cmd) {
+    if (njobs >= MAX_JOBS) {
+        fputs("ush: too many jobs\n", stderr);
+        free(cmd);
+        return -1;
+    }
+    int id = next_job_id++;
+    jobs[njobs].id = id;
+    jobs[njobs].pid = pid;
+    jobs[njobs].cmd = cmd;
+    jobs[njobs].done = 0;
+    jobs[njobs].status = 0;
+    njobs++;
+    printf("[%d] %d\n", id, (int)pid);
+    fflush(stdout);
+    return id;
+}
+
+static int parse_job_arg(const char *s, int *id_out) {
+    if (s[0] == '%') {
+        s++;
+    }
+    if (*s == '\0') {
+        return -1;
+    }
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == NULL || *end != '\0' || v <= 0) {
+        return -1;
+    }
+    *id_out = (int)v;
+    return 0;
+}
+
+static int builtin_jobs(void) {
+    reap_jobs();
+    for (int i = 0; i < njobs; i++) {
+        printf("[%d] %s %s\n", jobs[i].id,
+               jobs[i].done ? "Done" : "Running", jobs[i].cmd);
+    }
+    for (int i = njobs - 1; i >= 0; i--) {
+        if (jobs[i].done) {
+            remove_job_at(i);
+        }
+    }
+    return 0;
+}
+
+static int builtin_fg(char **argv, int argc) {
+    if (argc != 2) {
+        fputs("ush: fg: usage: fg %n\n", stderr);
+        return 1;
+    }
+    int id;
+    if (parse_job_arg(argv[1], &id) != 0) {
+        fprintf(stderr, "ush: fg: %s: no such job\n", argv[1]);
+        return 1;
+    }
+    reap_jobs();
+    struct job *job = find_job(id);
+    if (job == NULL) {
+        fprintf(stderr, "ush: fg: %%%d: no such job\n", id);
+        return 1;
+    }
+    if (!job->done) {
+        int status;
+        while (waitpid(job->pid, &status, 0) < 0) {
+            /* retry on EINTR */
+        }
+        job->status = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        job->done = 1;
+    }
+    int status = job->status;
+    /* find_job's pointer is invalidated by removal: locate by id. */
+    for (int i = 0; i < njobs; i++) {
+        if (jobs[i].id == id) {
+            remove_job_at(i);
+            break;
+        }
+    }
+    return status;
+}
+
+static int builtin_kill(char **argv, int argc) {
+    if (argc != 2) {
+        fputs("ush: kill: usage: kill %n | kill <pid>\n", stderr);
+        return 1;
+    }
+    pid_t pid;
+    if (argv[1][0] == '%') {
+        int id;
+        if (parse_job_arg(argv[1], &id) != 0) {
+            fprintf(stderr, "ush: kill: %s: no such job\n", argv[1]);
+            return 1;
+        }
+        reap_jobs();
+        struct job *job = find_job(id);
+        if (job == NULL || job->done) {
+            fprintf(stderr, "ush: kill: %%%d: no such job\n", id);
+            return 1;
+        }
+        pid = job->pid;
+    } else {
+        char *end = NULL;
+        long v = strtol(argv[1], &end, 10);
+        if (end == NULL || *end != '\0' || v <= 0) {
+            fprintf(stderr, "ush: kill: %s: invalid pid\n", argv[1]);
+            return 1;
+        }
+        pid = (pid_t)v;
+    }
+    if (kill(pid, SIGTERM) != 0) {
+        fprintf(stderr, "ush: kill: %s: ", argv[1]);
+        perror("");
+        return 1;
+    }
+    return 0;
+}
+
 static int run_builtin(char **argv, int argc, int last_status,
                        int *out, int *should_exit) {
     *should_exit = 0;
@@ -479,6 +650,18 @@ static int run_builtin(char **argv, int argc, int last_status,
     }
     if (strcmp(argv[0], "help") == 0) {
         *out = builtin_help();
+        return 1;
+    }
+    if (strcmp(argv[0], "jobs") == 0) {
+        *out = builtin_jobs();
+        return 1;
+    }
+    if (strcmp(argv[0], "fg") == 0) {
+        *out = builtin_fg(argv, argc);
+        return 1;
+    }
+    if (strcmp(argv[0], "kill") == 0) {
+        *out = builtin_kill(argv, argc);
         return 1;
     }
     if (strcmp(argv[0], "exit") == 0) {
